@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""billet: turnover for long-running Claude Code sessions. Standard library only.
+
+  billet check <transcript.jsonl> [--state STATE.md] [--rules rules.json]
+  billet brief <role-dir>
+  billet lint <TURNOVER.md>
+  billet successor <role-dir> --name Lead2 [--seal] [--dry-run]
+"""
+import argparse
+import calendar
+import json
+import os
+import re
+import statistics
+import sys
+import uuid
+from datetime import datetime
+
+RULES = {
+    "compactions": 4, "reread_ratio": 0.4,   # compactions >= N and re-read share after them
+    "cost_factor": 2.5, "recent_segments": 3,  # recent cost per progress vs the role's median
+    "stall_hours": 3.0,                        # no progress for this long
+    "repeat_fail": 3,                          # same failing command this many times
+    "weights": {"compactions": 1, "cost": 1, "stall": 1, "repeat": 1},
+    "watch_score": 1, "due_score": 2,
+}
+CAPS = {"total": 150, "LAWS": 40, "ORDERS": 30, "FACTS": 40, "SUSPECT": 30, "DO-NOT-CARRY": 10}
+BOOT = ["CLAUDE.md (this file)", "{ledger} (order ledger)", "{pred}/STATE.md (tail)",
+        "{pred}/TURNOVER.md (distilled findings of the predecessor)",
+        "{pred}/FACTS.md (last 40 lines: the person's words, verbatim, dated)",
+        "STATE.md (own)", "FACTS.md (own)"]
+FIRST_TASK = "verify every SUSPECT item, then act on ORDERS"
+TEMPLATE = """# TURNOVER (cap: {total} lines in total; run `billet lint TURNOVER.md`)
+
+## LAWS
+<!-- The person's words, verbatim and whole, one per line: - "quote" (date) -->
+
+## ORDERS
+<!-- Open orders with ledger ids: - [ID] text -->
+
+## FACTS
+<!-- Dated, each with evidence: - 2026-01-31 text | evidence: command or sha -->
+
+## SUSPECT
+<!-- Predecessor beliefs and workarounds without evidence. Re-verify before use. -->
+
+## DO-NOT-CARRY
+<!-- Habits judged as degradation. Do not copy them. -->
+"""
+
+
+def rd(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def load(path):
+    out = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                pass
+    return out
+
+
+def stamp(ev):
+    try:
+        return calendar.timegm(datetime.fromisoformat(str(ev.get("timestamp", "")).rstrip("Z")).timetuple())
+    except ValueError:
+        return None
+
+
+def blocks(ev):
+    c = (ev.get("message") or {}).get("content")
+    return [b for b in c if isinstance(b, dict)] if isinstance(c, list) else []
+
+
+def analyse(events):
+    """Return facts: compactions, reread ratio, cost segments, stall hours, worst repeat."""
+    seen, after, reads, rereads, comp = set(), set(), 0, 0, 0
+    cmds, fails, seg, segs, last_prog = {}, {}, 0, [], None
+    times = [t for t in map(stamp, events) if t is not None]
+    for ev in events:
+        if ev.get("subtype") == "compact_boundary" or ev.get("isCompactSummary"):
+            comp += 1
+            after = set(seen)
+        u = (ev.get("message") or {}).get("usage") or {}
+        seg += u.get("input_tokens", 0) + u.get("output_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+        progress = False
+        for b in blocks(ev):
+            if b.get("type") == "tool_use":
+                inp = b.get("input") or {}
+                if b.get("name") == "Read" and inp.get("file_path"):
+                    if comp:
+                        reads += 1
+                        rereads += inp["file_path"] in after
+                    seen.add(inp["file_path"])
+                cmd = inp.get("command")
+                if cmd:
+                    cmds[b.get("id")] = cmd.strip()
+                    # Progress: a commit, or a RESULT line appended to a state file from the shell.
+                    progress |= bool(re.search(r"\bgit\s+commit\b|\bRESULT:\s*(?:DONE|FAILED|BLOCKED)\b", cmd))
+            elif b.get("type") == "text" and ev.get("type") == "assistant":
+                progress |= bool(re.search(r"\bRESULT:\s*(?:DONE|FAILED|BLOCKED)\b", b.get("text", "")))
+            elif b.get("type") == "tool_result" and b.get("is_error") and b.get("tool_use_id") in cmds:
+                c = cmds[b["tool_use_id"]]
+                fails[c] = fails.get(c, 0) + 1
+        if progress:
+            segs.append(seg)
+            seg, last_prog = 0, stamp(ev) or last_prog
+    start = times[0] if times else 0
+    end = times[-1] if times else 0
+    stall = (end - (last_prog if last_prog is not None else start)) / 3600
+    worst = max(fails.items(), key=lambda kv: kv[1], default=("", 0))
+    return {"compactions": comp, "reread": rereads / reads if reads else 0.0, "segments": segs,
+            "tail_cost": seg, "stall_hours": stall, "worst_cmd": worst[0], "worst_n": worst[1]}
+
+
+def state_median(path):
+    if path and os.path.exists(path):
+        m = re.search(r"^median_cost_per_progress:\s*(\d+)", rd(path), re.MULTILINE)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def check(events, rules, state=None):
+    f, w, why = analyse(events), rules["weights"], []
+    score = 0
+    if f["compactions"] >= rules["compactions"] and f["reread"] >= rules["reread_ratio"]:
+        score += w["compactions"]
+        why.append(f"{f['compactions']} compactions with {f['reread']:.0%} of later reads repeating earlier reads")
+    segs = f["segments"]
+    n = rules["recent_segments"]
+    med = state_median(state) or (statistics.median(segs[:-n]) if len(segs) > n else None)
+    if med and segs:
+        recent = statistics.mean(segs[-n:])
+        if recent >= rules["cost_factor"] * med:
+            score += w["cost"]
+            why.append(f"cost per progress {recent:.0f} tokens is {recent / med:.1f}x the role median {med:.0f}")
+    if f["stall_hours"] >= rules["stall_hours"]:
+        score += w["stall"]
+        why.append(f"no RESULT line or commit for {f['stall_hours']:.1f} hours")
+    if f["worst_n"] >= rules["repeat_fail"]:
+        score += w["repeat"]
+        why.append(f"command failed {f['worst_n']} times: {f['worst_cmd'][:60]}")
+    verdict = "DUE" if score >= rules["due_score"] else "WATCH" if score >= rules["watch_score"] else "OK"
+    return verdict, why
+
+
+def sections(text):
+    cur, out = None, {}
+    for ln in text.splitlines():
+        m = re.match(r"##\s+(\S+)", ln)
+        if m:
+            cur = m.group(1)
+            out[cur] = []
+        elif cur and ln.strip() and not ln.strip().startswith("<!--"):
+            out[cur].append(ln)
+    return out
+
+
+def lint(text, caps=CAPS):
+    errs, secs = [], sections(text)
+    if len(text.splitlines()) > caps["total"]:
+        errs.append(f"over cap: {len(text.splitlines())} lines, max {caps['total']}")
+    for name in CAPS:
+        if name != "total" and name not in secs:
+            errs.append(f"missing section {name}")
+    for name, lines in secs.items():
+        if name in caps and len(lines) > caps[name]:
+            errs.append(f"{name} over cap: {len(lines)} lines, max {caps[name]}")
+        for ln in lines:
+            if name == "LAWS" and not re.match(r'^-\s+["“].+["”]', ln):
+                errs.append(f"LAWS line is not a quote: {ln[:50]}")
+            if name == "ORDERS" and not re.match(r"^-\s+\[[\w.-]+\]\s+\S", ln):
+                errs.append(f"ORDERS line has no ledger id: {ln[:50]}")
+            if name == "FACTS" and not re.match(r"^-\s+\d{4}-\d\d-\d\d\s.*\|\s*evidence:\s*\S", ln):
+                errs.append(f"FACTS line has no date or evidence: {ln[:50]}")
+    return errs
+
+
+def successor(role, name, seal=False, dry=False, ledger=None, origin="", chain=""):
+    role = os.path.abspath(role)
+    pred, parent = os.path.basename(role), os.path.dirname(role)
+    new = os.path.join(parent, name)
+    if name == pred or os.path.exists(new):
+        raise SystemExit(f"billet: {new} exists or equals the predecessor")
+    ledger = ledger or os.path.join(parent, "ORDERS.md")
+    boot = "\n".join(f"{i}. " + b.format(ledger=ledger, pred=role) for i, b in enumerate(BOOT, 1))
+    # Static text first, boot list in a fixed order, nothing time-dependent: the prefix stays cache-stable.
+    claude = (f"# {name}\n\nSuccessor of {pred}. Origin: \"{origin or 'TODO: one-line quote from the person'}\"\n\n"
+              f"Chain of command: {chain or 'TODO: person > lead > ' + name}\n\n"
+              f"{pred} is read-only history; never edit it.\n\n## Boot (read in this order)\n{boot}\n\n"
+              f"## First task\n{FIRST_TASK}.\n")
+    sid = str(uuid.uuid4())
+    env = (f"# Launcher env for {name}. Start fresh: claude --session-id $BILLET_SESSION_ID\n"
+           f"# Resume later with: claude --resume $BILLET_SESSION_ID (same id keeps the prompt cache warm)\n"
+           f"BILLET_ROLE={name}\nBILLET_SESSION_ID={sid}\nBILLET_ROLE_DIR={new}\n")
+    files = {"CLAUDE.md": claude, "launcher.env": env, "STATE.md": f"# {name} state\n", "FACTS.md": f"# {name} facts\n"}
+    if dry:
+        print(f"[dry-run] would create {new}")
+        for k, v in files.items():
+            print(f"--- {k}\n{v}", end="")
+        print(f"[dry-run] would {'seal' if seal else 'not seal'} {role}")
+        return new, sid
+    os.makedirs(new)
+    for k, v in files.items():
+        with open(os.path.join(new, k), "w", encoding="utf-8") as f:
+            f.write(v)
+    if seal:
+        for d, _, fs in os.walk(role):
+            for p in [d] + [os.path.join(d, x) for x in fs]:
+                os.chmod(p, os.stat(p).st_mode & ~0o222)
+        print(f"sealed {role}")
+    print(f"created {new}\nsession id {sid}")
+    return new, sid
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="billet", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("check")
+    c.add_argument("transcript")
+    c.add_argument("--state")
+    c.add_argument("--rules", help="JSON file overriding the default rules")
+    sub.add_parser("brief").add_argument("role_dir")
+    sub.add_parser("lint").add_argument("file")
+    s = sub.add_parser("successor")
+    s.add_argument("role_dir")
+    s.add_argument("--name", required=True)
+    s.add_argument("--seal", action="store_true", help="chmod -R a-w the predecessor folder")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--ledger")
+    s.add_argument("--origin", default="")
+    s.add_argument("--chain", default="")
+    a = ap.parse_args(argv)
+    if a.cmd == "check":
+        rules = dict(RULES)
+        if a.rules:
+            rules.update(json.loads(rd(a.rules)))
+        verdict, why = check(load(a.transcript), rules, a.state)
+        print(verdict)
+        for r in why:
+            print("- " + r)
+        return {"OK": 0, "WATCH": 1, "DUE": 2}[verdict]
+    if a.cmd == "brief":
+        p = os.path.join(a.role_dir, "TURNOVER.md")
+        if os.path.exists(p):
+            raise SystemExit(f"billet: {p} exists")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(TEMPLATE.format(total=CAPS["total"]))
+        print(f"wrote {p}")
+        return 0
+    if a.cmd == "lint":
+        errs = lint(rd(a.file))
+        print("\n".join(errs) if errs else "LINT: OK")
+        return 1 if errs else 0
+    successor(a.role_dir, a.name, a.seal, a.dry_run, a.ledger, a.origin, a.chain)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
